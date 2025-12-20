@@ -6,3 +6,4 @@
 3. Использование arch i386
 Пользуйтесь, удачи
 CREATOR OS: yodaosdev@mail.ru
+<img width="1632" height="763" alt="Снимок экрана от 2025-12-21 00-06-35" src="https://github.com/user-attachments/assets/62cade04-6c36-4d43-a843-7b8d072e7d3f" />
