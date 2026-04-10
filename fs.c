@@ -2,16 +2,27 @@
 #include "drivers.h"
 #include "kernel.h"
 #include "string.h"
-#include <stddef.h>
+#include "types.h"
+
+static uint32_t highest_data_block_used = 0;
+static uint32_t next_free_block = 0;
+uint32_t partition_offset = 0;
+int file_count = 0;
 
 static file_entry_t file_table[MAX_FILES];
-static int file_count = 0;
 static int cwd_id = 0;
 static uint8_t disk_blocks[1024][512];
 
 #define SUPERBLOCK_LBA   1
 #define TABLE_START_LBA  2
 #define DATA_START_LBA   8
+
+static int read_sector(uint32_t lba, void *buf) {
+    return ata_read_sectors(partition_offset + lba, 1, buf);
+}
+static int write_sector(uint32_t lba, const void *buf) {
+    return ata_write_sectors(partition_offset + lba, 1, buf);
+}
 
 static int find_file_by_fullpath(const char *abs_path) {
     for (int i = 0; i < file_count; i++)
@@ -53,34 +64,80 @@ static int resolve_path(const char *path, char *abs_path, int abs_len) {
     return find_file_by_fullpath(abs_path);
 }
 
+int fs_exists(const char *path) {
+    char abs_path[128];
+    if (path[0] == '/') {
+        strncpy(abs_path, path, sizeof(abs_path)-1);
+        abs_path[sizeof(abs_path)-1] = 0;
+    } else {
+        char cwd_buf[64];
+        fs_get_cwd(cwd_buf, sizeof(cwd_buf));
+        if (strcmp(cwd_buf, "/") == 0) {
+            abs_path[0] = '/';
+            strcpy(abs_path + 1, path);
+        } else {
+            strcpy(abs_path, cwd_buf);
+            strcat(abs_path, "/");
+            strcat(abs_path, path);
+        }
+    }
+    normalize_path(abs_path);
+    return find_file_by_fullpath(abs_path) >= 0 ? 1 : 0;
+}
+
 void fs_sync_to_disk(void) {
-    if (ata_init() != 0) return;
+    if (partition_offset == 0) return;
+
+    yfs_superblock_t sb;
+    memset(&sb, 0, sizeof(sb));
+    sb.magic = YFS_MAGIC;
+    sb.version = YFS_VERSION;
+    sb.block_size = 512;
+    sb.total_blocks = 1024;
+    sb.free_blocks = 1024 - (highest_data_block_used + 1);
+    *(uint32_t*)&sb.reserved[0] = highest_data_block_used;
+    write_sector(SUPERBLOCK_LBA, &sb);
+
     uint8_t table_buf[512 * 6];
     memset(table_buf, 0, sizeof(table_buf));
     memcpy(table_buf, file_table, sizeof(file_table));
     for (int i = 0; i < 6; i++)
-        ata_write_sectors(TABLE_START_LBA + i, 1, table_buf + i * 512);
-    for (int i = 0; i < 1024; i++)
-        ata_write_sectors(DATA_START_LBA + i, 1, disk_blocks[i]);
+        write_sector(TABLE_START_LBA + i, table_buf + i * 512);
+
+    for (uint32_t i = 0; i <= highest_data_block_used && i < 1024; i++)
+        write_sector(DATA_START_LBA + i, disk_blocks[i]);
 }
 
 void fs_load_from_disk(void) {
-    if (ata_init() != 0) return;
+    if (partition_offset == 0) return;
+
+    yfs_superblock_t sb;
+    if (read_sector(SUPERBLOCK_LBA, &sb) != 0) return;
+    if (sb.magic != YFS_MAGIC) return;
+
+    highest_data_block_used = *(uint32_t*)&sb.reserved[0];
+    if (highest_data_block_used >= 1024) highest_data_block_used = 0;
+    next_free_block = highest_data_block_used + 1;
+    if (next_free_block >= 1024) next_free_block = 1023;
+
     uint8_t table_buf[512 * 6];
     for (int i = 0; i < 6; i++)
-        ata_read_sectors(TABLE_START_LBA + i, 1, table_buf + i * 512);
+        read_sector(TABLE_START_LBA + i, table_buf + i * 512);
+    memset(file_table, 0, sizeof(file_table));
     memcpy(file_table, table_buf, sizeof(file_table));
-    if (strcmp(file_table[0].name, ROOT_DIR) != 0 || file_table[0].parent != -1) {
-        fs_init();
-        return;
-    }
+
+    if (strcmp(file_table[0].name, ROOT_DIR) != 0) return;
+    file_table[0].parent = -1;
+
     file_count = 0;
     for (int i = 0; i < MAX_FILES; i++) {
         if (file_table[i].name[0] == 0) break;
         file_count++;
     }
-    for (int i = 0; i < 1024; i++)
-        ata_read_sectors(DATA_START_LBA + i, 1, disk_blocks[i]);
+
+    for (uint32_t i = 0; i <= highest_data_block_used && i < 1024; i++)
+        read_sector(DATA_START_LBA + i, disk_blocks[i]);
+
     cwd_id = 0;
 }
 
@@ -90,9 +147,11 @@ void fs_init(void) {
     strcpy(file_table[0].name, ROOT_DIR);
     file_table[0].flags = 1;
     file_table[0].parent = -1;
+    file_table[0].first_block = 0;
     file_count = 1;
     cwd_id = 0;
-    fs_load_from_disk();
+    next_free_block = 0;
+    highest_data_block_used = 0;
 }
 
 int fs_create(const char *name, uint8_t is_dir) {
@@ -119,9 +178,13 @@ int fs_create(const char *name, uint8_t is_dir) {
     strncpy(file_table[file_count].name, abs_path, MAX_FILENAME - 1);
     file_table[file_count].name[MAX_FILENAME - 1] = 0;
     file_table[file_count].size = 0;
-    file_table[file_count].first_block = file_count;
+    file_table[file_count].first_block = next_free_block++;
     file_table[file_count].flags = is_dir ? 1 : 0;
     file_table[file_count].parent = cwd_id;
+
+    if (next_free_block - 1 > highest_data_block_used)
+        highest_data_block_used = next_free_block - 1;
+
     file_count++;
     fs_sync_to_disk();
     return 0;
@@ -151,6 +214,14 @@ int fs_write(const char *name, const uint8_t *data, uint32_t size) {
     uint32_t blocks_needed = (size + 511) / 512;
     if (blocks_needed > 1024) blocks_needed = 1024;
     uint32_t block_idx = file_table[idx].first_block;
+    uint32_t max_block = block_idx + blocks_needed - 1;
+    if (max_block >= 1024) return -1;
+
+    if (max_block > highest_data_block_used)
+        highest_data_block_used = max_block;
+    if (max_block + 1 > next_free_block)
+        next_free_block = max_block + 1;
+
     for (uint32_t b = 0; b < blocks_needed; b++) {
         uint32_t offset = b * 512;
         uint32_t copy = (size - offset > 512) ? 512 : (size - offset);
@@ -244,6 +315,7 @@ int fs_is_directory(const char *name) {
     return (file_table[idx].flags & 1) ? 1 : 0;
 }
 
+// ----- Shell commands -----
 void cmd_rm(const char *arg) {
     while (*arg == ' ') arg++;
     if (strncmp(arg, "-d ", 3) == 0) {
@@ -272,7 +344,9 @@ void cmd_rm(const char *arg) {
         vga_write("Usage: rm -d <dir> | rm -f <file>\n", VGA_COLOR_LIGHT_RED);
     }
 }
+
 void cmd_ls(void) { fs_list(); }
+
 void cmd_cat(const char *fname) {
     uint8_t buf[512];
     uint32_t size;
@@ -284,12 +358,14 @@ void cmd_cat(const char *fname) {
         vga_write("File not found\n", VGA_COLOR_LIGHT_RED);
     }
 }
+
 void cmd_touch(const char *fname) {
     if (fs_create(fname, 0) == 0)
         vga_write("File created\n", VGA_COLOR_LIGHT_GREEN);
     else
         vga_write("Failed to create file\n", VGA_COLOR_LIGHT_RED);
 }
+
 void cmd_pwd(void) {
     char buf[64];
     fs_get_cwd(buf, 64);
