@@ -1,6 +1,4 @@
-; boot.asm - Multiboot compliant bootloader for YodaOS (flat binary)
-; Compile: nasm -f elf32 boot.asm -o boot.o
-
+; boot.asm - Multiboot compliant bootloader (flat binary)
 section .multiboot
 align 4
     dd 0x1BADB002          ; magic
@@ -12,7 +10,7 @@ global start
 extern kmain
 
 start:
-    mov esp, stack_top     ; setup stack
+    mov esp, stack_top
     push eax               ; pass multiboot magic
     push ebx               ; pass multiboot info structure
     call kmain
