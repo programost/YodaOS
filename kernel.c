@@ -1,10 +1,13 @@
 #include "kernel.h"
 #include "drivers.h"
 #include "fs.h"
-#include <stddef.h>
 #include "string.h"
 
+uint32_t multiboot_magic = 0;
+multiboot_info_t *multiboot_info = NULL;
+
 static uint32_t rand_seed = 1;
+
 void srand(uint32_t seed) { rand_seed = seed; }
 uint32_t rand(void) {
     rand_seed = rand_seed * 1103515245 + 12345;
@@ -21,7 +24,6 @@ char getchar(void) {
     return c;
 }
 
-// ----- Вспомогательная функция для преобразования числа в строку (для прогресс-бара и date) -----
 static void int_to_str(int num, char *out) {
     if (num == 0) {
         out[0] = '0';
@@ -39,28 +41,60 @@ static void int_to_str(int num, char *out) {
     out[j] = '\0';
 }
 
-// ----- Команды -----
 void cmd_reboot(void) {
     fs_sync_to_disk();
+    ata_flush();
     vga_write("Rebooting...\n", VGA_COLOR_LIGHT_GREEN);
     reboot();
 }
 
 void cmd_shutdown(void) {
     fs_sync_to_disk();
+    ata_flush();
     vga_write("Shutting down...\n", VGA_COLOR_LIGHT_GREEN);
     shutdown();
 }
 
 void cmd_sysinf(void) {
-    vga_write("YodaOS 1.0 (i386) - 32-bit\n", VGA_COLOR_LIGHT_CYAN);
+    vga_write("YodaOS 1.2 (i386)\n", VGA_COLOR_LIGHT_CYAN);
     vga_write("Kernel: YodaOS kernel (c) 1996\n", VGA_COLOR_LIGHT_GREY);
-    vga_write("Drivers: VGA, Keyboard (polling), ATA, PC Speaker, CMOS/RTC\n", VGA_COLOR_LIGHT_GREY);
+
+    if (multiboot_magic == 0x2BADB002 && multiboot_info && (multiboot_info->flags & 1)) {
+        uint32_t total_kb = multiboot_info->mem_lower + multiboot_info->mem_upper;
+        char buf[32];
+        int_to_str(total_kb / 1024, buf);
+        vga_write("RAM: ", VGA_COLOR_LIGHT_GREY);
+        vga_write(buf, VGA_COLOR_WHITE);
+        vga_write(" MB\n", VGA_COLOR_LIGHT_GREY);
+    } else {
+        vga_write("RAM: unknown\n", VGA_COLOR_LIGHT_GREY);
+    }
+
+    if (disk_total_sectors > 0) {
+        uint32_t disk_mb = (disk_total_sectors * 512) / (1024 * 1024);
+        char buf[32];
+        int_to_str(disk_mb, buf);
+        vga_write("Disk: ", VGA_COLOR_LIGHT_GREY);
+        vga_write(buf, VGA_COLOR_WHITE);
+        vga_write(" MB total\n", VGA_COLOR_LIGHT_GREY);
+
+        if (partition_offset > 0) {
+            uint32_t part_mb = ((disk_total_sectors - partition_offset) * 512) / (1024 * 1024);
+            int_to_str(part_mb, buf);
+            vga_write("Partition: ", VGA_COLOR_LIGHT_GREY);
+            vga_write(buf, VGA_COLOR_WHITE);
+            vga_write(" MB available\n", VGA_COLOR_LIGHT_GREY);
+        }
+    } else {
+        vga_write("Disk: unknown\n", VGA_COLOR_LIGHT_GREY);
+    }
+
+    vga_write("Drivers: VGA, Keyboard, ATA, PC Speaker, CMOS/RTC\n", VGA_COLOR_LIGHT_GREY);
 }
 
 static const char *commands[] = {
     "reboot", "shutdown", "sysinf", "help -p", "clear", "asciiart",
-    "cpuid", "memtest", "rand", "date -d/-t", "pause",
+    "cpuid", "memtest", "rand", "date -d/-t", "pause", "format",
     "ls", "cat", "touch", "pwd", "ynan", "rm"
 };
 #define NUM_COMMANDS (sizeof(commands)/sizeof(commands[0]))
@@ -141,7 +175,6 @@ void cmd_rand(void) {
     vga_write("\n", VGA_COLOR_LIGHT_GREY);
 }
 
-// ---------- ИСПРАВЛЕННАЯ КОМАНДА DATE ----------
 void cmd_date(int show_date, int show_time) {
     if (show_date) {
         int year, month, day;
@@ -180,7 +213,6 @@ void cmd_date(int show_date, int show_time) {
     }
 }
 
-// ---------- ИСПРАВЛЕННАЯ КОМАНДА PAUSE ----------
 void cmd_pause(void) {
     uint8_t old_x, old_y;
     vga_get_cursor(&old_x, &old_y);
@@ -188,22 +220,39 @@ void cmd_pause(void) {
     int len = strlen(msg);
     int x = (VGA_WIDTH - len) / 2;
     int y = VGA_HEIGHT / 2;
-    // Сохраняем строку, на которой будем выводить сообщение
     uint16_t saved_line[VGA_WIDTH];
     for (int i = 0; i < VGA_WIDTH; i++)
         saved_line[i] = VGA_MEMORY[y * VGA_WIDTH + i];
     vga_set_cursor(x, y);
     vga_write(msg, VGA_COLOR_LIGHT_CYAN);
-    // Ждём любую клавишу
     wait_for_key();
-    // Восстанавливаем строку
     for (int i = 0; i < VGA_WIDTH; i++)
         VGA_MEMORY[y * VGA_WIDTH + i] = saved_line[i];
-    // Возвращаем курсор
     vga_set_cursor(old_x, old_y);
 }
 
+void cmd_format(void) {
+    if (disk_total_sectors == 0) {
+        vga_write("Error: disk size unknown.\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+    uint32_t part_sectors = disk_total_sectors - 1;
+    char buf[32];
+    int_to_str(part_sectors, buf);
+    vga_write("Creating YFS partition (type 0x7F) with ", VGA_COLOR_LIGHT_GREEN);
+    vga_write(buf, VGA_COLOR_LIGHT_GREEN);
+    vga_write(" sectors...\n", VGA_COLOR_LIGHT_GREEN);
 
+    if (disk_create_yfs_partition(1, part_sectors) == 0) {
+        vga_write("MBR written. Partition created.\n", VGA_COLOR_LIGHT_GREEN);
+        partition_offset = 1;
+        fs_init();               // сбрасываем ФС в памяти
+        fs_sync_to_disk();       // записываем начальную структуру на диск
+        vga_write("Filesystem initialized on new partition.\n", VGA_COLOR_LIGHT_GREEN);
+    } else {
+        vga_write("Failed to write MBR.\n", VGA_COLOR_LIGHT_RED);
+    }
+}
 
 static void show_progress(int current, int total, const char *label) {
     char buf[80];
@@ -238,7 +287,6 @@ static void show_progress(int current, int total, const char *label) {
     vga_set_cursor(old_x, old_y);
 }
 
-// ----- Оболочка (shell) -----
 void shell(void) {
     char cmd[64];
     int cmd_pos = 0;
@@ -281,6 +329,7 @@ void shell(void) {
                 cmd_date(d, t);
             }
             else if (strcmp(cmd, "pause") == 0) cmd_pause();
+            else if (strcmp(cmd, "format") == 0) cmd_format();
             else if (strcmp(cmd, "ls") == 0) cmd_ls();
             else if (strcmp(cmd, "pwd") == 0) cmd_pwd();
             else if (strncmp(cmd, "cat ", 4) == 0) cmd_cat(cmd+4);
@@ -304,29 +353,66 @@ void shell(void) {
     }
 }
 
-// ----- Точка входа -----
-void kmain(uint32_t magic, uint32_t addr) {
+void kmain(uint32_t __attribute__((unused)) magic, uint32_t __attribute__((unused)) addr) {
+    multiboot_magic = magic;
+    multiboot_info = (multiboot_info_t*)addr;
     vga_init();
-    vga_write("YodaOS 1.0 (32-bit) for i386\n", VGA_COLOR_LIGHT_CYAN);
-    if (ata_init() == 0)
-        vga_write("ATA drive detected.\n", VGA_COLOR_LIGHT_GREEN);
-    else
-        vga_write("No ATA drive. Using RAM-only FS.\n", VGA_COLOR_LIGHT_RED);
-    sound_init();
+    vga_write("YodaOS 1.4 (i386)\n", VGA_COLOR_LIGHT_CYAN);
+
+    if (ata_init() == 0) {
+        vga_write("ATA drive detected. ", VGA_COLOR_LIGHT_GREEN);
+        char buf[32];
+        int_to_str(disk_total_sectors, buf);
+        vga_write(buf, VGA_COLOR_LIGHT_GREEN);
+        vga_write(" sectors.\n", VGA_COLOR_LIGHT_GREEN);
+    } else {
+        vga_write("No ATA drive. Halting.\n", VGA_COLOR_LIGHT_RED);
+        while(1);
+    }
+
+    // Инициализируем пустую ФС в памяти (без записи на диск)
     fs_init();
 
-    const char *init_items[] = {"DRV", "BOOT", "KRN", "USR", "TMP", "kernel_panic.sysdump.bin"};
-    int total = sizeof(init_items) / sizeof(init_items[0]);
-    for (int i = 0; i < total; i++) {
-        show_progress(i, total, init_items[i]);
-        if (i < 5)
-            fs_create(init_items[i], 1);
-        else
-            fs_create(init_items[i], 0);
+    uint32_t part_start, part_sectors;
+    if (disk_find_yfs_partition(&part_start, &part_sectors) == 0) {
+        partition_offset = part_start;
+        char buf[32];
+        int_to_str(part_start, buf);
+        vga_write("Found YFS partition at LBA ", VGA_COLOR_LIGHT_GREEN);
+        vga_write(buf, VGA_COLOR_LIGHT_GREEN);
+        vga_write("\n", VGA_COLOR_LIGHT_GREEN);
+
+        // Загружаем данные с диска (если ФС существует)
+        fs_load_from_disk();
+    } else {
+        vga_write("No YFS partition found. Type 'format' to create one.\n", VGA_COLOR_LIGHT_BROWN);
+        partition_offset = 0;
+        // ФС остаётся чистой в памяти, ждём format
     }
-    show_progress(total, total, "Done!");
+
+    sound_init();
+
+    // Если ФС загружена и в ней уже есть файлы (кроме корня) - прогресс-бар не показываем
+    extern int file_count;
+    if (file_count > 1) {
+        // ФС уже содержит системные папки, ничего не создаём
+        show_progress(1, 1, "FS loaded");
+    } else {
+        // ФС пуста (только корень) – создаём системные папки
+        const char *init_items[] = {"DRV", "BOOT", "KRN", "USR", "TMP", "kernel_panic.sysdump.bin"};
+        int total = sizeof(init_items) / sizeof(init_items[0]);
+        for (int i = 0; i < total; i++) {
+            show_progress(i, total, init_items[i]);
+            if (i < 5)
+                fs_create(init_items[i], 1);
+            else
+                fs_create(init_items[i], 0);
+        }
+        show_progress(total, total, "Done!");
+    }
+
     cmd_clear();
-    vga_write("YodaOS 1.0 (32-bit) for i386\n", VGA_COLOR_LIGHT_CYAN);
+    vga_write("YodaOS 1.4 (i386)\n", VGA_COLOR_LIGHT_CYAN);
     vga_write("ATA drive detected.\n", VGA_COLOR_LIGHT_GREEN);
     vga_write("Filesystem ready.\n", VGA_COLOR_LIGHT_GREEN);
     vga_write("Type 'help -p' for commands.\n", VGA_COLOR_LIGHT_GREY);
