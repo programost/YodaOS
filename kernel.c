@@ -7,7 +7,6 @@ uint32_t multiboot_magic = 0;
 multiboot_info_t *multiboot_info = NULL;
 
 static uint32_t rand_seed = 1;
-
 void srand(uint32_t seed) { rand_seed = seed; }
 uint32_t rand(void) {
     rand_seed = rand_seed * 1103515245 + 12345;
@@ -61,8 +60,9 @@ void cmd_sysinf(void) {
 
     if (multiboot_magic == 0x2BADB002 && multiboot_info && (multiboot_info->flags & 1)) {
         uint32_t total_kb = multiboot_info->mem_lower + multiboot_info->mem_upper;
+        uint32_t total_mb = total_kb / 1024;
         char buf[32];
-        int_to_str(total_kb / 1024, buf);
+        int_to_str(total_mb, buf);
         vga_write("RAM: ", VGA_COLOR_LIGHT_GREY);
         vga_write(buf, VGA_COLOR_WHITE);
         vga_write(" MB\n", VGA_COLOR_LIGHT_GREY);
@@ -79,7 +79,8 @@ void cmd_sysinf(void) {
         vga_write(" MB total\n", VGA_COLOR_LIGHT_GREY);
 
         if (partition_offset > 0) {
-            uint32_t part_mb = ((disk_total_sectors - partition_offset) * 512) / (1024 * 1024);
+            uint32_t part_sectors = disk_total_sectors - partition_offset;
+            uint32_t part_mb = (part_sectors * 512) / (1024 * 1024);
             int_to_str(part_mb, buf);
             vga_write("Partition: ", VGA_COLOR_LIGHT_GREY);
             vga_write(buf, VGA_COLOR_WHITE);
@@ -95,7 +96,7 @@ void cmd_sysinf(void) {
 static const char *commands[] = {
     "reboot", "shutdown", "sysinf", "help -p", "clear", "asciiart",
     "cpuid", "memtest", "rand", "date -d/-t", "pause", "format",
-    "ls", "cat", "touch", "pwd", "ynan", "rm"
+    "ls", "cat", "touch", "pwd", "ynan", "rm", "exec"
 };
 #define NUM_COMMANDS (sizeof(commands)/sizeof(commands[0]))
 #define CMDS_PER_PAGE 10
@@ -105,7 +106,7 @@ void cmd_help_p(int page) {
     int total_pages = (NUM_COMMANDS + CMDS_PER_PAGE - 1) / CMDS_PER_PAGE;
     if (page > total_pages) page = total_pages;
     int start = (page - 1) * CMDS_PER_PAGE;
-    int end = start + CMDS_PER_PAGE;
+    unsigned int end = start + CMDS_PER_PAGE;
     if (end > NUM_COMMANDS) end = NUM_COMMANDS;
     vga_write("--- Help page ", VGA_COLOR_LIGHT_CYAN);
     char pnum[4]; pnum[0] = '0' + page; pnum[1] = 0;
@@ -114,7 +115,7 @@ void cmd_help_p(int page) {
     char tpages[4]; tpages[0] = '0' + total_pages; tpages[1] = 0;
     vga_write(tpages, VGA_COLOR_LIGHT_CYAN);
     vga_write(" ---\n", VGA_COLOR_LIGHT_CYAN);
-    for (int i = start; i < end; i++) {
+    for (int i = start; i < (int)end; i++) {
         vga_write("  ", VGA_COLOR_LIGHT_GREY);
         vga_write(commands[i], VGA_COLOR_LIGHT_GREEN);
         vga_write("\n", VGA_COLOR_LIGHT_GREY);
@@ -246,8 +247,8 @@ void cmd_format(void) {
     if (disk_create_yfs_partition(1, part_sectors) == 0) {
         vga_write("MBR written. Partition created.\n", VGA_COLOR_LIGHT_GREEN);
         partition_offset = 1;
-        fs_init();               // сбрасываем ФС в памяти
-        fs_sync_to_disk();       // записываем начальную структуру на диск
+        fs_init();
+        fs_sync_to_disk();
         vga_write("Filesystem initialized on new partition.\n", VGA_COLOR_LIGHT_GREEN);
     } else {
         vga_write("Failed to write MBR.\n", VGA_COLOR_LIGHT_RED);
@@ -287,15 +288,66 @@ static void show_progress(int current, int total, const char *label) {
     vga_set_cursor(old_x, old_y);
 }
 
+#define HISTORY_SIZE 10
+static char history[HISTORY_SIZE][64];
+static int history_count = 0;
+static int history_index = -1;
+
 void shell(void) {
     char cmd[64];
     int cmd_pos = 0;
+    memset(history, 0, sizeof(history));
+    history_count = 0;
+    history_index = -1;
+
     vga_write("\n$> ", VGA_COLOR_LIGHT_GREEN);
     while (1) {
-        char c = getchar();
+        uint8_t sc = wait_for_key();
+        if (sc == 0xE0) {
+            uint8_t sc2 = wait_for_key();
+            if (sc2 == 0x48) { // Up
+                if (history_count > 0 && history_index < history_count - 1) {
+                    history_index++;
+                    while (cmd_pos > 0) { cmd_pos--; vga_putchar('\b', VGA_COLOR_LIGHT_GREY); }
+                    strcpy(cmd, history[history_count - 1 - history_index]);
+                    cmd_pos = strlen(cmd);
+                    vga_write(cmd, VGA_COLOR_LIGHT_GREY);
+                }
+            } else if (sc2 == 0x50) { // Down
+                if (history_index > 0) {
+                    history_index--;
+                    while (cmd_pos > 0) { cmd_pos--; vga_putchar('\b', VGA_COLOR_LIGHT_GREY); }
+                    strcpy(cmd, history[history_count - 1 - history_index]);
+                    cmd_pos = strlen(cmd);
+                    vga_write(cmd, VGA_COLOR_LIGHT_GREY);
+                } else if (history_index == 0) {
+                    history_index = -1;
+                    while (cmd_pos > 0) { cmd_pos--; vga_putchar('\b', VGA_COLOR_LIGHT_GREY); }
+                    cmd[0] = '\0'; cmd_pos = 0;
+                }
+            }
+            continue;
+        }
+
+        char c = scancode_to_char(sc);
         if (c == '\n' || c == '\r') {
-            cmd[cmd_pos] = 0;
+            cmd[cmd_pos] = '\0';
             vga_write("\n", VGA_COLOR_LIGHT_GREY);
+
+            if (cmd[0] != '\0') {
+                if (history_count == 0 || strcmp(history[history_count-1], cmd) != 0) {
+                    if (history_count < HISTORY_SIZE) {
+                        strcpy(history[history_count], cmd);
+                        history_count++;
+                    } else {
+                        for (int i = 0; i < HISTORY_SIZE-1; i++)
+                            strcpy(history[i], history[i+1]);
+                        strcpy(history[HISTORY_SIZE-1], cmd);
+                    }
+                }
+            }
+            history_index = -1;
+
             if (strcmp(cmd, "reboot") == 0) cmd_reboot();
             else if (strcmp(cmd, "shutdown") == 0) cmd_shutdown();
             else if (strcmp(cmd, "sysinf") == 0) cmd_sysinf();
@@ -336,7 +388,14 @@ void shell(void) {
             else if (strncmp(cmd, "touch ", 6) == 0) cmd_touch(cmd+6);
             else if (strncmp(cmd, "ynan ", 5) == 0) cmd_ynan(cmd+5);
             else if (strncmp(cmd, "rm ", 3) == 0) cmd_rm(cmd+3);
+            else if (strcmp(cmd, "exec") == 0) {
+                vga_write("Usage: exec <filename>\n", VGA_COLOR_LIGHT_RED);
+            }
+            else if (strncmp(cmd, "exec ", 5) == 0) {
+                vga_write("Exec not implemented yet\n", VGA_COLOR_LIGHT_BROWN);
+            }
             else if (cmd[0] != 0) vga_write("Unknown command\n", VGA_COLOR_LIGHT_RED);
+
             cmd_pos = 0;
             vga_write("$> ", VGA_COLOR_LIGHT_GREEN);
         }
@@ -353,11 +412,12 @@ void shell(void) {
     }
 }
 
-void kmain(uint32_t __attribute__((unused)) magic, uint32_t __attribute__((unused)) addr) {
+void kmain(uint32_t magic, uint32_t addr) {
     multiboot_magic = magic;
     multiboot_info = (multiboot_info_t*)addr;
+
     vga_init();
-    vga_write("YodaOS 1.4 (i386)\n", VGA_COLOR_LIGHT_CYAN);
+    vga_write("YodaOS 1.2 (i386)\n", VGA_COLOR_LIGHT_CYAN);
 
     if (ata_init() == 0) {
         vga_write("ATA drive detected. ", VGA_COLOR_LIGHT_GREEN);
@@ -370,7 +430,6 @@ void kmain(uint32_t __attribute__((unused)) magic, uint32_t __attribute__((unuse
         while(1);
     }
 
-    // Инициализируем пустую ФС в памяти (без записи на диск)
     fs_init();
 
     uint32_t part_start, part_sectors;
@@ -381,24 +440,17 @@ void kmain(uint32_t __attribute__((unused)) magic, uint32_t __attribute__((unuse
         vga_write("Found YFS partition at LBA ", VGA_COLOR_LIGHT_GREEN);
         vga_write(buf, VGA_COLOR_LIGHT_GREEN);
         vga_write("\n", VGA_COLOR_LIGHT_GREEN);
-
-        // Загружаем данные с диска (если ФС существует)
         fs_load_from_disk();
     } else {
         vga_write("No YFS partition found. Type 'format' to create one.\n", VGA_COLOR_LIGHT_BROWN);
         partition_offset = 0;
-        // ФС остаётся чистой в памяти, ждём format
     }
 
     sound_init();
 
-    // Если ФС загружена и в ней уже есть файлы (кроме корня) - прогресс-бар не показываем
-    extern int file_count;
     if (file_count > 1) {
-        // ФС уже содержит системные папки, ничего не создаём
         show_progress(1, 1, "FS loaded");
     } else {
-        // ФС пуста (только корень) – создаём системные папки
         const char *init_items[] = {"DRV", "BOOT", "KRN", "USR", "TMP", "kernel_panic.sysdump.bin"};
         int total = sizeof(init_items) / sizeof(init_items[0]);
         for (int i = 0; i < total; i++) {
@@ -412,7 +464,7 @@ void kmain(uint32_t __attribute__((unused)) magic, uint32_t __attribute__((unuse
     }
 
     cmd_clear();
-    vga_write("YodaOS 1.4 (i386)\n", VGA_COLOR_LIGHT_CYAN);
+    vga_write("YodaOS 1.2 (i386)\n", VGA_COLOR_LIGHT_CYAN);
     vga_write("ATA drive detected.\n", VGA_COLOR_LIGHT_GREEN);
     vga_write("Filesystem ready.\n", VGA_COLOR_LIGHT_GREEN);
     vga_write("Type 'help -p' for commands.\n", VGA_COLOR_LIGHT_GREY);
