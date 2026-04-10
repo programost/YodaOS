@@ -1,37 +1,41 @@
-CC = gcc -m32 -ffreestanding -nostdlib -nostartfiles -fno-stack-protector -c
-AS = nasm -f elf32
-LD = ld -m elf_i386 -T linker.ld
+CC = gcc
+ASM = nasm
+LD = ld
 
-OBJS = boot.o kernel.o drivers.o fs.o asm_funcs.o string.o
+CFLAGS = -m32 -ffreestanding -nostdlib -nostdinc -fno-pie -fno-stack-protector -Wall -Wextra -I. -Os
+ASMFLAGS = -f elf32
+LDFLAGS = -m elf_i386 -T linker.ld -no-pie
 
-all: yodaos.bin
+OBJS = boot.o asm_funcs.o kernel.o drivers.o fs.o string.o
 
-yodaos.bin: $(OBJS)
-	$(LD) $(OBJS) -o yodaos.bin
+all: yodaos.iso
 
-boot.o: boot.asm
-	$(AS) boot.asm -o boot.o
+%.o: %.asm
+	$(ASM) $(ASMFLAGS) $< -o $@
 
-asm_funcs.o: asm_funcs.asm
-	$(AS) asm_funcs.asm -o asm_funcs.o
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-kernel.o: kernel.c kernel.h drivers.h fs.h string.h
-	$(CC) kernel.c -o kernel.o
+kernel.elf: $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ $^
 
-drivers.o: drivers.c drivers.h kernel.h
-	$(CC) drivers.c -o drivers.o
-
-fs.o: fs.c fs.h drivers.h kernel.h string.h
-	$(CC) fs.c -o fs.o
-
-string.o: string.c string.h
-	$(CC) string.c -o string.o
+yodaos.iso: kernel.elf
+	mkdir -p iso/boot/grub
+	cp kernel.elf iso/boot/kernel.elf
+	echo 'set timeout=0' > iso/boot/grub/grub.cfg
+	echo 'set default=0' >> iso/boot/grub/grub.cfg
+	echo 'menuentry "YodaOS" {' >> iso/boot/grub/grub.cfg
+	echo '    multiboot /boot/kernel.elf' >> iso/boot/grub/grub.cfg
+	echo '    boot' >> iso/boot/grub/grub.cfg
+	echo '}' >> iso/boot/grub/grub.cfg
+	grub-mkrescue -o yodaos.iso iso
 
 clean:
-	rm -f *.o yodaos.bin disk.img
+	rm -f *.o kernel.elf yodaos.iso
+	rm -rf iso
 
-run: yodaos.bin
-	qemu-system-i386 -kernel yodaos.bin -hda disk.img
+run: yodaos.iso
+	qemu-system-i386 -cdrom yodaos.iso -m 64 -drive file=disk.img,format=raw,if=ide -boot d
 
-create_disk:
-	dd if=/dev/zero of=disk.img bs=512 count=20480
+disk.img:
+	dd if=/dev/zero of=disk.img bs=512 count=131072
