@@ -2,12 +2,21 @@ ENTRY(start)
 
 SECTIONS
 {
-    . = 0x100000;          /* GRUB загружает ядро по адресу 1MB */
+    . = 1M;
 
-    .multiboot : { *(.multiboot) }
-    .text : { *(.text) }
-    .data : { *(.data) }
-    .bss : { *(.bss) }
+    .multiboot : {
+        *(.multiboot)
+    }
 
-    /DISCARD/ : { *(.comment) *(.note) }
+    .text : {
+        *(.text)
+    }
+
+    .data : {
+        *(.data)
+    }
+
+    .bss : {
+        *(.bss)
+    }
 }
