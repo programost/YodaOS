@@ -1,4 +1,3 @@
-; asm_funcs.asm
 section .text
 global outb, inb, outw, inw, cpuid, reboot, shutdown, wait_for_key
 
@@ -41,10 +40,28 @@ cpuid:
 
 reboot:
     cli
+    ; Сброс контроллера ATA
+    mov dx, 0x3F6
+    mov al, 0x04
+    out dx, al
+    mov ecx, 100000
+.delay1:
+    loop .delay1
+    mov al, 0x00
+    out dx, al
+
+    ; Ожидание готовности клавиатуры
+.wait_kb:
+    in al, 0x64
+    test al, 2
+    jnz .wait_kb
+
+    ; Отправка команды сброса процессора
     mov al, 0xFE
     out 0x64, al
-    jmp 0xffff:0x0000
 
+    ; На всякий случай — далёкий прыжок к BIOS
+    jmp 0xffff:0x0000
 shutdown:
     cli
     mov dx, 0x604
