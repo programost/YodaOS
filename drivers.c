@@ -1,6 +1,8 @@
 #include "drivers.h"
 #include "kernel.h"
-#include <stddef.h>
+#include "string.h"
+
+uint32_t disk_total_sectors = 0;
 
 // ----- VGA -----
 static uint8_t vga_x = 0, vga_y = 0;
@@ -72,11 +74,10 @@ void vga_get_cursor(uint8_t *x, uint8_t *y) {
     *x = vga_x; *y = vga_y;
 }
 
-// ----- Keyboard with Shift and Caps Lock -----
+// ----- Keyboard -----
 static uint8_t shift_pressed = 0;
 static uint8_t caps_lock = 0;
 
-// Таблица для сканкодов без Shift (нижний регистр / базовые символы)
 static const char scancode_normal[] = {
     0,   0, '1','2','3','4','5','6','7','8','9','0','-','=', 0, 0,
     'q','w','e','r','t','y','u','i','o','p','[',']', 0, 0,
@@ -84,7 +85,6 @@ static const char scancode_normal[] = {
     '\\','z','x','c','v','b','n','m',',','.','/', 0, '*', 0, ' '
 };
 
-// Таблица для сканкодов с Shift (верхний регистр / символы верхнего регистра)
 static const char scancode_shift[] = {
     0,   0, '!','@','#','$','%','^','&','*','(',')','_','+', 0, 0,
     'Q','W','E','R','T','Y','U','I','O','P','{','}', 0, 0,
@@ -97,7 +97,6 @@ static const char scancode_shift[] = {
 #define SCANCODE_CAPSLOCK 0x3A
 
 char scancode_to_char(uint8_t scancode) {
-    // Обработка нажатия/отпускания Shift
     if (scancode == SCANCODE_LSHIFT || scancode == SCANCODE_RSHIFT) {
         shift_pressed = 1;
         return 0;
@@ -106,49 +105,40 @@ char scancode_to_char(uint8_t scancode) {
         shift_pressed = 0;
         return 0;
     }
-    // Обработка Caps Lock (только нажатие)
     if (scancode == SCANCODE_CAPSLOCK) {
         caps_lock = !caps_lock;
         return 0;
     }
-    // Игнорируем отпускания остальных клавиш
     if (scancode & 0x80) return 0;
 
-    // Определяем базовый символ
     char c = 0;
     if (scancode < sizeof(scancode_normal)) {
         c = shift_pressed ? scancode_shift[scancode] : scancode_normal[scancode];
-        // Действие Caps Lock только на буквы
         if (caps_lock && (c >= 'a' && c <= 'z')) {
             c = c - 'a' + 'A';
         } else if (caps_lock && (c >= 'A' && c <= 'Z')) {
             c = c - 'A' + 'a';
         }
     }
-    // Специальные клавиши, не вошедшие в таблицы
     if (c == 0) {
         switch (scancode) {
-            case 0x1C: return '\n';   // Enter
-            case 0x0E: return '\b';   // Backspace
-            case 0x01: return 0x1B;   // Escape
+            case 0x1C: return '\n';
+            case 0x0E: return '\b';
+            case 0x01: return 0x1B;
             default: return 0;
         }
     }
     return c;
 }
 
-uint8_t keyboard_get_shift(void) {
-    return shift_pressed;
-}
+uint8_t keyboard_get_shift(void) { return shift_pressed; }
+uint8_t keyboard_get_capslock(void) { return caps_lock; }
 
-uint8_t keyboard_get_capslock(void) {
-    return caps_lock;
-}
+// ----- ATA PIO with LBA28 -----
+static int ata_flush_cache(void);
 
-// ----- ATA PIO (первичный мастер) -----
-static void ata_wait_400ns(void) {
-    for (int i = 0; i < 4; i++)
-        inb(ATA_PRIMARY_IO + 7);
+static void ata_delay(void) {
+    for (volatile int i = 0; i < 10000; i++);
 }
 
 static int ata_poll_ready(void) {
@@ -158,30 +148,46 @@ static int ata_poll_ready(void) {
             if (status & 0x08) return 1;
             if (status & 0x01) return 0;
         }
-        ata_wait_400ns();
+        for (volatile int j = 0; j < 100; j++);
     }
     return 0;
 }
 
 int ata_init(void) {
     outb(ATA_PRIMARY_CTRL, 0x04);
-    for (int i = 0; i < 1000; i++) inb(ATA_PRIMARY_IO + 7);
+    ata_delay();
     outb(ATA_PRIMARY_CTRL, 0x00);
-    
+    ata_delay();
+
+    int timeout = 100000;
+    while ((inb(ATA_PRIMARY_IO + 7) & 0x80) && --timeout);
+
     outb(ATA_PRIMARY_IO + 6, 0xA0);
+    ata_delay();
+
     outb(ATA_PRIMARY_IO + 2, 0x00);
     outb(ATA_PRIMARY_IO + 3, 0x00);
     outb(ATA_PRIMARY_IO + 4, 0x00);
     outb(ATA_PRIMARY_IO + 5, 0x00);
     outb(ATA_PRIMARY_IO + 7, 0xEC);
-    
+
     if (!ata_poll_ready()) return -1;
-    
+
     uint16_t identify[256];
     for (int i = 0; i < 256; i++)
         identify[i] = inw(ATA_PRIMARY_IO);
-    
+
     if (identify[0] == 0 || identify[0] == 0xFFFF) return -1;
+
+    // Получаем размер диска без нарушения strict-aliasing
+    uint32_t sectors;
+    if (identify[83] & (1 << 10)) {
+        memcpy(&sectors, &identify[100], sizeof(uint32_t));
+    } else {
+        memcpy(&sectors, &identify[60], sizeof(uint32_t));
+    }
+    disk_total_sectors = sectors;
+
     return 0;
 }
 
@@ -192,7 +198,7 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
     outb(ATA_PRIMARY_IO + 4, (uint8_t)(lba >> 8));
     outb(ATA_PRIMARY_IO + 5, (uint8_t)(lba >> 16));
     outb(ATA_PRIMARY_IO + 7, 0x20);
-    
+
     uint16_t *buf16 = (uint16_t*)buffer;
     for (int s = 0; s < count; s++) {
         if (!ata_poll_ready()) return -1;
@@ -203,27 +209,87 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
 }
 
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
-    outb(ATA_PRIMARY_IO + 6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(ATA_PRIMARY_IO + 2, count);
-    outb(ATA_PRIMARY_IO + 3, (uint8_t)lba);
-    outb(ATA_PRIMARY_IO + 4, (uint8_t)(lba >> 8));
-    outb(ATA_PRIMARY_IO + 5, (uint8_t)(lba >> 16));
-    outb(ATA_PRIMARY_IO + 7, 0x30);
-    
-    const uint16_t *buf16 = (const uint16_t*)buffer;
-    for (int s = 0; s < count; s++) {
-        if (!ata_poll_ready()) return -1;
-        for (int i = 0; i < 256; i++)
-            outw(ATA_PRIMARY_IO, buf16[s*256 + i]);
+    int retry = 3;
+    while (retry--) {
+        outb(ATA_PRIMARY_IO + 6, 0xE0 | ((lba >> 24) & 0x0F));
+        outb(ATA_PRIMARY_IO + 2, count);
+        outb(ATA_PRIMARY_IO + 3, (uint8_t)lba);
+        outb(ATA_PRIMARY_IO + 4, (uint8_t)(lba >> 8));
+        outb(ATA_PRIMARY_IO + 5, (uint8_t)(lba >> 16));
+        outb(ATA_PRIMARY_IO + 7, 0x30);
+
+        const uint16_t *buf16 = (const uint16_t*)buffer;
+        int s;
+        for (s = 0; s < count; s++) {
+            if (!ata_poll_ready()) break;
+            for (int i = 0; i < 256; i++)
+                outw(ATA_PRIMARY_IO, buf16[s*256 + i]);
+        }
+        if (s == count) {
+            // Успешно записано — сбрасываем кэш
+            ata_flush_cache();
+            return 0;
+        }
+        // Повтор после сброса контроллера
+        outb(ATA_PRIMARY_CTRL, 0x04);
+        ata_delay();
+        outb(ATA_PRIMARY_CTRL, 0x00);
+        ata_delay();
     }
-    return 0;
+    return -1;
 }
 
-// ----- Sound (PC Speaker) -----
-void sound_init(void) {
-    outb(0x61, inb(0x61) & 0xFC);
+static int ata_flush_cache(void) {
+    outb(ATA_PRIMARY_IO + 6, 0xE0); // мастер
+    outb(ATA_PRIMARY_IO + 7, 0xE7); // FLUSH CACHE
+    return ata_poll_ready();
+}
+void ata_flush(void) {
+    ata_flush_cache();
 }
 
+// ----- MBR / Partition -----
+int disk_find_yfs_partition(uint32_t *out_lba_start, uint32_t *out_sectors) {
+    mbr_t mbr;
+    for (int retry = 3; retry > 0; retry--) {
+        if (ata_read_sectors(0, 1, &mbr) == 0) break;
+        // Сброс контроллера
+        outb(ATA_PRIMARY_CTRL, 0x04);
+        ata_delay();
+        outb(ATA_PRIMARY_CTRL, 0x00);
+        ata_delay();
+    }
+    if (mbr.signature != 0xAA55) return -1;
+
+    for (int i = 0; i < 4; i++) {
+        if (mbr.partitions[i].type == PARTITION_YFS_TYPE) {
+            *out_lba_start = mbr.partitions[i].lba_start;
+            *out_sectors = mbr.partitions[i].sectors_count;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int disk_create_yfs_partition(uint32_t start_lba, uint32_t sectors) {
+    mbr_t mbr;
+    if (ata_read_sectors(0, 1, &mbr) != 0) {
+        memset(&mbr, 0, sizeof(mbr));
+    }
+    mbr.signature = 0xAA55;
+
+    mbr.partitions[0].status = 0x80;
+    mbr.partitions[0].type = PARTITION_YFS_TYPE;
+    mbr.partitions[0].lba_start = start_lba;
+    mbr.partitions[0].sectors_count = sectors;
+
+    memset(&mbr.partitions[1], 0, sizeof(mbr_partition_t) * 3);
+
+    return ata_write_sectors(0, 1, &mbr);
+}
+
+// ----- Sound -----
+void sound_init(void) { outb(0x61, inb(0x61) & 0xFC); }
 void sound_beep(uint32_t frequency, uint32_t duration_ms) {
     uint32_t div = 1193180 / frequency;
     outb(0x43, 0xB6);
@@ -233,16 +299,13 @@ void sound_beep(uint32_t frequency, uint32_t duration_ms) {
     for (volatile uint32_t i = 0; i < duration_ms * 1000; i++);
     outb(0x61, inb(0x61) & 0xFC);
 }
+void sound_off(void) { outb(0x61, inb(0x61) & 0xFC); }
 
-void sound_off(void) {
-    outb(0x61, inb(0x61) & 0xFC);
-}
 // ----- CMOS / RTC -----
 uint8_t cmos_read(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
 }
-
 void get_rtc_time(int *hour, int *minute, int *second) {
     *hour = cmos_read(0x04);
     *minute = cmos_read(0x02);
@@ -251,7 +314,6 @@ void get_rtc_time(int *hour, int *minute, int *second) {
     *minute = ((*minute >> 4) * 10) + (*minute & 0x0F);
     *second = ((*second >> 4) * 10) + (*second & 0x0F);
 }
-
 void get_rtc_date(int *year, int *month, int *day) {
     *year = cmos_read(0x09);
     *month = cmos_read(0x08);
