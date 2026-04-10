@@ -1,7 +1,7 @@
 #ifndef DRIVERS_H
 #define DRIVERS_H
 
-#include <stdint.h>
+#include "types.h"
 
 // VGA text mode 80x25, color
 #define VGA_WIDTH  80
@@ -44,9 +44,33 @@ uint8_t keyboard_get_capslock(void);
 #define ATA_PRIMARY_CTRL   0x3F6
 #define ATA_SECTOR_SIZE    512
 
+extern uint32_t disk_total_sectors;   // общий размер диска в секторах
+
 int ata_init(void);
 int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer);
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer);
+void ata_flush(void);
+
+// Partition support
+#define PARTITION_YFS_TYPE  0x7F
+
+typedef struct {
+    uint8_t  status;
+    uint8_t  chs_first[3];
+    uint8_t  type;
+    uint8_t  chs_last[3];
+    uint32_t lba_start;
+    uint32_t sectors_count;
+} __attribute__((packed)) mbr_partition_t;
+
+typedef struct {
+    uint8_t  bootstrap[446];
+    mbr_partition_t partitions[4];
+    uint16_t signature;
+} __attribute__((packed)) mbr_t;
+
+int disk_find_yfs_partition(uint32_t *out_lba_start, uint32_t *out_sectors);
+int disk_create_yfs_partition(uint32_t start_lba, uint32_t sectors);
 
 // Sound (PC Speaker)
 void sound_init(void);
