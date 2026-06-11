@@ -168,7 +168,7 @@ static const char *commands[] = {
     "rand", "date -d/-t", "pause", "format", "ring3test", "panic_test",
     "ls", "cd", "pwd", "mkdir", "rmdir", "rm -f/-d", "cat", "touch", "cp", "mv",
     "sync", "uname", "wc", "head", "tail", "grep",
-    "ynan", "exec", "shlog"
+    "ynan", "exec", "shlog", "mtdisk"
 };
 #define NUM_COMMANDS (sizeof(commands)/sizeof(commands[0]))
 #define CMDS_PER_PAGE 10
@@ -450,7 +450,10 @@ void kmain(uint32_t magic, uint32_t addr) {
     dbstring(&INFO, "System started!");
     dbstring(&INFO, "Login as 'root'");
     log_save_to_file();
+    fs_sync_to_disk();   
+    cmd_clear();
     cmd_asciiart();
     vga_write("YodaOS version 2.0 (Beta test edition)\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("if you started the system for the first time, please type mtdisk for mount ext2\n", VGA_COLOR_LIGHT_GREEN);
     shell_run();
 }
