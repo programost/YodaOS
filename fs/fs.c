@@ -1209,10 +1209,6 @@ int fs_delete(const char *name) {
     uint32_t ino;
     if (lookup_path(abs, &ino, 0) != 0) return -1;
     if (ino == EXT2_ROOT_INO) return -1;
-    if (strcmp(abs, "/shlog.log") == 0){
-        vga_write("Error: can't remove file, its system file. (protected)", VGA_COLOR_LIGHT_RED);
-        return -1;
-    }
     struct ext2_inode target;
     if (read_inode_raw(ino, &target) != 0) return -1;
     int is_dir = ((target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
@@ -1292,12 +1288,8 @@ int fs_open(const char *name, uint8_t *data, uint32_t buf_max, uint32_t *size_ou
 int fs_write(const char *name, const uint8_t *data, uint32_t size) {
     if (!fs_mounted) return -1;
     char abs[256];
-    path_to_abs(name, abs, sizeof(abs));
-        if (strcmp(abs, "/shlog.log") == 0) {
-        vga_write("Error: Cannot write to /shlog.log (protected)\n", VGA_COLOR_LIGHT_RED);
-        return -1;
-    }
     uint32_t ino;
+    path_to_abs(name, abs, sizeof(abs));
     if (lookup_path(abs, &ino, 0) != 0) {
         // Файл не существует, создаём
         if (fs_create(abs, 0) != 0) return -1;
@@ -1437,7 +1429,6 @@ int fs_rename(const char *oldpath, const char *newpath) {
 int fs_mv_path(const char *from, const char *to) {
     return fs_rename(from, to);
 }
-
 void fs_list_at_path(const char *ext2_abs_dir) {
     if (!fs_mounted) {
         vga_write("(ext2 not mounted)\n", VGA_COLOR_LIGHT_RED);
@@ -1445,29 +1436,33 @@ void fs_list_at_path(const char *ext2_abs_dir) {
     }
     uint32_t ino;
     if (lookup_path(ext2_abs_dir, &ino, 1) != 0) {
-        vga_write("(bad ext2 path)\n", VGA_COLOR_LIGHT_RED);
+        vga_write("ls: bad path\n", VGA_COLOR_LIGHT_RED);
         return;
     }
     struct ext2_inode di;
-    if (read_inode_raw(ino, &di) != 0) return;
-
+    if (read_inode_raw(ino, &di) != 0) {
+        vga_write("ls: cannot read inode\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+    if ((di.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
+        vga_write("ls: not a directory\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
     uint32_t pos = 0;
-    // Временно выделим буфер для одной записи, но будем читать через inode_read_range
-    uint8_t *buf = (uint8_t*)0x300000; // временная область
     while (pos < di.i_size) {
-        // Читаем до конца блока, но не более 512 байт за раз для безопасности
-        uint32_t chunk = di.i_size - pos;
-        if (chunk > 512) chunk = 512;
-        if (inode_read_range(&di, pos, buf, chunk) != 0) break;
-
-        uint32_t off = 0;
-        while (off < chunk) {
-            struct ext2_dir_entry_2 *de = (struct ext2_dir_entry_2*)(buf + off);
+        uint32_t block_idx = pos / block_size;
+        uint32_t offset = pos % block_size;
+        uint32_t disk_block = inode_bmap(&di, block_idx);
+        if (disk_block == 0) break;
+        uint8_t buf[block_size];
+        if (read_one_block(disk_block, buf) != 0) break;
+        uint32_t off = offset;
+        while (off < block_size && pos + off < di.i_size) {
+            struct ext2_dir_entry_2 *de = (struct ext2_dir_entry_2 *)(buf + off);
             uint16_t rec_len = de->rec_len;
-            if (rec_len < 8 || off + rec_len > chunk) break;
-            if (de->inode != 0) {
+            if (rec_len < 8 || off + rec_len > block_size) break;
+            if (de->inode != 0 && de->name_len > 0 && de->name_len <= 255) {
                 char name[256];
-                if (de->name_len >= sizeof(name)) break;
                 memcpy(name, de->name, de->name_len);
                 name[de->name_len] = '\0';
                 if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
@@ -1479,7 +1474,7 @@ void fs_list_at_path(const char *ext2_abs_dir) {
             }
             off += rec_len;
         }
-        pos += chunk;
+        pos += block_size - offset;
     }
     vga_write("\n", VGA_COLOR_LIGHT_GREY);
 }
@@ -1491,53 +1486,65 @@ void fs_list_long_at_path(const char *ext2_abs_dir, int show_all) {
     }
     uint32_t ino;
     if (lookup_path(ext2_abs_dir, &ino, 1) != 0) {
-        vga_write("(bad ext2 path)\n", VGA_COLOR_LIGHT_RED);
+        vga_write("ls: bad path\n", VGA_COLOR_LIGHT_RED);
         return;
     }
     struct ext2_inode di;
-    if (read_inode_raw(ino, &di) != 0) return;
+    if (read_inode_raw(ino, &di) != 0) {
+        vga_write("ls: cannot read inode\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+    if ((di.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) {
+        vga_write("ls: not a directory\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
     uint32_t pos = 0;
     while (pos < di.i_size) {
-        uint8_t hdr[8];
-        if (inode_read_range(&di, pos, hdr, 8) != 0) break;
-        uint16_t rl = (uint16_t)(hdr[4] | (hdr[5] << 8));
-        if (rl < 8 || pos + rl > di.i_size) break;
-        if (inode_read_range(&di, pos, dentry_read_buf, rl) != 0) break;
-        struct ext2_dir_entry_2 *de = (struct ext2_dir_entry_2 *)dentry_read_buf;
-        if (de->rec_len != rl && de->rec_len < rl) break;
-        char nb[256];
-        if ((size_t)de->name_len + 1 >= sizeof(nb)) break;
-        memcpy(nb, de->name, de->name_len);
-        nb[de->name_len] = 0;
-        if (!show_all && (strcmp(nb, ".") == 0 || strcmp(nb, "..") == 0)) {
-            pos += rl;
-            continue;
+        uint32_t block_idx = pos / block_size;
+        uint32_t offset = pos % block_size;
+        uint32_t disk_block = inode_bmap(&di, block_idx);
+        if (disk_block == 0) break;
+        uint8_t buf[block_size];
+        if (read_one_block(disk_block, buf) != 0) break;
+        uint32_t off = offset;
+        while (off < block_size && pos + off < di.i_size) {
+            struct ext2_dir_entry_2 *de = (struct ext2_dir_entry_2 *)(buf + off);
+            uint16_t rec_len = de->rec_len;
+            if (rec_len < 8 || off + rec_len > block_size) break;
+            if (de->inode != 0 && de->name_len > 0 && de->name_len <= 255) {
+                char name[256];
+                memcpy(name, de->name, de->name_len);
+                name[de->name_len] = '\0';
+                if (!show_all && (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)) {
+                    off += rec_len;
+                    continue;
+                }
+                struct ext2_inode fin;
+                if (read_inode_raw(de->inode, &fin) != 0) {
+                    off += rec_len;
+                    continue;
+                }
+                char md[12];
+                md[0] = ((fin.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ? 'd' : '-';
+                uint16_t perm = fin.i_mode & 0777;
+                const char *rwx = "rwxrwxrwx";
+                for (int j = 0; j < 9; j++)
+                    md[1+j] = (perm & (1u << (8-j))) ? rwx[j] : '-';
+                md[10] = 0;
+                vga_write(md, VGA_COLOR_LIGHT_GREY);
+                vga_write(" 1 root root ", VGA_COLOR_LIGHT_GREY);
+                char szb[16];
+                int_to_str((int)fin.i_size, szb);
+                vga_write(szb, VGA_COLOR_LIGHT_CYAN);
+                vga_write(" 0 ", VGA_COLOR_LIGHT_GREY);
+                vga_write(name, VGA_COLOR_LIGHT_GREEN);
+                if (de->file_type == EXT2_FT_DIR)
+                    vga_write("/", VGA_COLOR_LIGHT_CYAN);
+                vga_write("\n", VGA_COLOR_LIGHT_GREY);
+            }
+            off += rec_len;
         }
-        struct ext2_inode fin;
-        char md[12];
-        if (read_inode_raw(de->inode, &fin) != 0) {
-            pos += rl;
-            continue;
-        }
-        md[0] = ((fin.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ? 'd' : '-';
-        uint16_t perm = fin.i_mode & 0777;
-        const char *rwx = "rwxrwxrwx";
-        for (int i = 0; i < 9; i++)
-            md[1 + i] = (perm & (1u << (8 - i))) ? rwx[i] : '-';
-        md[10] = 0;
-        vga_write(md, VGA_COLOR_LIGHT_GREY);
-        vga_write(" 1 root root ", VGA_COLOR_LIGHT_GREY);
-        char szb[16];
-        int_to_str((int)fin.i_size, szb);
-        vga_write(szb, VGA_COLOR_LIGHT_CYAN);
-        vga_write(" ", VGA_COLOR_LIGHT_GREY);
-        int_to_str((int)fin.i_mtime, szb);
-        vga_write(szb, VGA_COLOR_LIGHT_BROWN);
-        vga_write(" ", VGA_COLOR_LIGHT_GREY);
-        vga_write(nb, VGA_COLOR_LIGHT_GREEN);
-        if (de->file_type == EXT2_FT_DIR) vga_write("/", VGA_COLOR_LIGHT_CYAN);
-        vga_write("\n", VGA_COLOR_LIGHT_GREY);
-        pos += rl;
+        pos += block_size - offset;
     }
 }
 
