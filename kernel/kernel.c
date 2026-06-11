@@ -4,13 +4,23 @@
 #include "ramfs.h"
 #include "shell.h"
 #include "string.h"
+#include "log.h"
 
 uint32_t multiboot_magic = 0;
 multiboot_info_t *multiboot_info = NULL;
 
+extern uint32_t partition_offset;
+
 #define MULTIBOOT2_MAGIC 0x36d76289
 static uint32_t mb2_mem_lower_kb;
 static uint32_t mb2_mem_upper_kb;
+
+const char* OFF = "[OFF]";
+const char* ON = "[ON]";
+const char* DEBUG = "[DEBUG]";
+const char* INFO = "[INFO]";
+const char* WARNING = "[WARNING]";
+const char* ERR = "[ERROR]";
 
 static void parse_multiboot2(uint32_t phys) {
     mb2_mem_lower_kb = 0;
@@ -31,6 +41,15 @@ static void parse_multiboot2(uint32_t phys) {
         off += (size + 7u) & ~7u;
     }
 }
+static uint8_t user_ring3_stack[4096] __attribute__((aligned(16)));
+extern void syscall_setup(void);
+/*/void syscall_init() {
+    uint64_t handler = (uint64_t)syscall_entry;
+    __asm__ volatile("wrmsr" : : "c"(0xC0000082), "a"((uint32_t)handler), "d"((uint32_t)(handler >> 32)));
+    // Устанавливаем маску для rflags (бит 9 для IF)
+    uint64_t mask = 0x200; // Бит 9 (IF) — прерывания разрешены?
+    __asm__ volatile("wrmsr" : : "c"(0xC0000084), "a"((uint32_t)mask), "d"((uint32_t)(mask >> 32)));
+}/*/
 
 static uint32_t rand_seed = 1;
 void srand(uint32_t seed) { rand_seed = seed; }
@@ -54,6 +73,35 @@ void kernel_panic_stack_test(void) {
         __asm__ volatile("pause" ::: "memory");
 }
 
+void panic_handler(int vector) {
+    vga_clear(VGA_COLOR_BLACK | (VGA_COLOR_BLACK << 4));
+    int x = VGA_WIDTH;
+    int y = VGA_HEIGHT;
+    const char* msg = "KERNEL PANIC\n";
+    vga_set_cursor((x/2)-strlen(msg), 0);
+    vga_write(msg, VGA_COLOR_LIGHT_RED);
+    vga_write("Exception: ", VGA_COLOR_LIGHT_RED);
+    char buf[8];
+    int_to_str(vector, buf);
+    vga_write(buf, VGA_COLOR_LIGHT_RED);
+    if (fs_is_mounted() && fs_exists("/shlog.log")) {
+        vga_write("--- System log (/shlog.log) ---\n", VGA_COLOR_LIGHT_CYAN);
+        uint8_t log_buf[4096];
+        uint32_t sz;
+        if (fs_open("/shlog.log", log_buf, sizeof(log_buf)-1, &sz) == 0) {
+            log_buf[sz] = '\0';
+            vga_write((char*)log_buf, VGA_COLOR_LIGHT_GREY);
+            vga_write("\n--- End of log ---\n", VGA_COLOR_LIGHT_CYAN);
+        } else {
+            vga_write("Failed to read log file.\n", VGA_COLOR_LIGHT_RED);
+        }
+    } else {
+        vga_write("No log file available.\n", VGA_COLOR_LIGHT_BROWN);
+    }
+    vga_write("\nSystem halted. Please reboot pc!\n", VGA_COLOR_LIGHT_RED);
+    for(;;) __asm__ volatile("hlt");
+}
+
 void cmd_reboot(void) {
     fs_sync_to_disk();
     ata_flush();
@@ -69,8 +117,8 @@ void cmd_shutdown(void) {
 }
 
 void cmd_sysinf(void) {
-    vga_write("YodaOS 1.2 (x86_64, ELF64)\n", VGA_COLOR_LIGHT_CYAN);
-    vga_write("Kernel: YodaOS kernel (c) 1996\n", VGA_COLOR_LIGHT_GREY);
+    vga_write("YodaOS 2.0 (x86_64, ELF64)\n", VGA_COLOR_LIGHT_CYAN);
+    vga_write("Kernel: YodaOS kernel 2.0-path-1.0.0\n", VGA_COLOR_LIGHT_GREY);
 
     if (multiboot_magic == MULTIBOOT2_MAGIC && (mb2_mem_lower_kb || mb2_mem_upper_kb)) {
         uint32_t total_kb = mb2_mem_lower_kb + mb2_mem_upper_kb;
@@ -116,11 +164,11 @@ void cmd_sysinf(void) {
 }
 
 static const char *commands[] = {
-    "reboot", "shutdown", "sysinf", "help -p", "clear", "asciiart",
-    "cpuid", "memtest", "rand", "date -d/-t", "pause", "format",
-    "busybox (multi-call applets)", "ls cat cp mv mkdir rm cd pwd",
-    "echo touch sync uname wc head tail grep", "ynan", "sh / source / .",
-    "ring3test", "panic_test", "exec"
+    "reboot", "shutdown", "sysinf", "clear", "asciiart", "cpuid", "memtest",
+    "rand", "date -d/-t", "pause", "format", "ring3test", "panic_test",
+    "ls", "cd", "pwd", "mkdir", "rmdir", "rm -f/-d", "cat", "touch", "cp", "mv",
+    "sync", "uname", "wc", "head", "tail", "grep",
+    "ynan", "exec", "shlog"
 };
 #define NUM_COMMANDS (sizeof(commands)/sizeof(commands[0]))
 #define CMDS_PER_PAGE 10
@@ -133,10 +181,12 @@ void cmd_help_p(int page) {
     unsigned int end = start + CMDS_PER_PAGE;
     if (end > NUM_COMMANDS) end = NUM_COMMANDS;
     vga_write("--- Help page ", VGA_COLOR_LIGHT_CYAN);
-    char pnum[4]; pnum[0] = '0' + page; pnum[1] = 0;
+    char pnum[8];
+    int_to_str(page, pnum);
     vga_write(pnum, VGA_COLOR_LIGHT_CYAN);
     vga_write(" of ", VGA_COLOR_LIGHT_CYAN);
-    char tpages[4]; tpages[0] = '0' + total_pages; tpages[1] = 0;
+    char tpages[8];
+    int_to_str(total_pages, tpages);
     vga_write(tpages, VGA_COLOR_LIGHT_CYAN);
     vga_write(" ---\n", VGA_COLOR_LIGHT_CYAN);
     for (int i = start; i < (int)end; i++) {
@@ -146,7 +196,6 @@ void cmd_help_p(int page) {
     }
     vga_write("Use 'help -p <page>' for more.\n", VGA_COLOR_LIGHT_GREY);
 }
-
 void cmd_clear(void) {
     vga_clear(VGA_COLOR_BLACK | (VGA_COLOR_BLACK << 4));
     vga_set_cursor(0, 0);
@@ -154,25 +203,37 @@ void cmd_clear(void) {
 }
 
 void cmd_asciiart(void) {
-    vga_write("\n", VGA_COLOR_LIGHT_GREY);
-    vga_write("  YYYY   OOO   DDD    AAA    OOO   SSS\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("  Y  Y  O   O  D  D  A   A  O   O  S\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("  Y  Y  O   O  D   D AAAAA  O   O   SS\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("  YYY   O   O  D  D  A   A  O   O     S\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("  Y     OOO   DDD   A   A  OOO   SSS\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("       $&$   $&$  /$&&&&&$\\  $$$$$$$$$\\     /$&&&$\\\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("        $&$ $&$   $&$   $&$  $&$    $&$    /$&$ $&$\\\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("         $&&&$    $&$   $&$  $&$    $&$    $&$   $&$\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("          $&$     $&$   $&$  $&$    $&$    $&&&&&&&$\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("          $&$     $&$   $&$  $&$    $&$    $&$   $&$\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write("          $$$     \\$&&&&&$/  $&&&&&&&$/    $$$   $$$\n", VGA_COLOR_LIGHT_GREEN);
     vga_write("            YodaOS - May the code be with you\n", VGA_COLOR_LIGHT_CYAN);
     vga_write("\n", VGA_COLOR_LIGHT_GREY);
 }
 
 void cmd_cpuid(void) {
     uint32_t eax, ebx, ecx, edx;
-    cpuid(0, &eax, &ebx, &ecx, &edx);
-    vga_write("Vendor: ", VGA_COLOR_LIGHT_GREY);
+    // Vendor (leaf 0)
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
     char vendor[13] = {0};
     *(uint32_t*)(vendor) = ebx;
     *(uint32_t*)(vendor+4) = edx;
     *(uint32_t*)(vendor+8) = ecx;
+    vga_write("Vendor: ", VGA_COLOR_LIGHT_GREY);
     vga_write(vendor, VGA_COLOR_LIGHT_CYAN);
+    vga_write("\n", VGA_COLOR_LIGHT_GREY);
+    // Features (leaf 1)
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+    vga_write("Model: ", VGA_COLOR_LIGHT_GREY);
+    char buf[16];
+    int_to_str((eax >> 4) & 0x0F, buf);
+    vga_write(buf, VGA_COLOR_LIGHT_CYAN);
+    vga_write("\n", VGA_COLOR_LIGHT_GREY);
+    vga_write("Stepping: ", VGA_COLOR_LIGHT_GREY);
+    int_to_str(eax & 0x0F, buf);
+    vga_write(buf, VGA_COLOR_LIGHT_CYAN);
     vga_write("\n", VGA_COLOR_LIGHT_GREY);
 }
 
@@ -251,10 +312,19 @@ void cmd_pause(void) {
         saved_line[i] = VGA_MEMORY[y * VGA_WIDTH + i];
     vga_set_cursor(x, y);
     vga_write(msg, VGA_COLOR_LIGHT_CYAN);
-    wait_for_key();
+    // Ожидание нажатия любой клавиши (игнорируем старое состояние)
+    uint8_t sc;
+    do {
+        sc = inb(0x60);
+        // Ждём, пока в порте 0x64 не появится бит 1 (данные готовы)
+        while (!(inb(0x64) & 1)) { __asm__ volatile("pause"); }
+        sc = inb(0x60);
+    } while (sc == 0); // 0 означает, что это не символ (может быть скан-код)
+    // Восстановление
     for (int i = 0; i < VGA_WIDTH; i++)
         VGA_MEMORY[y * VGA_WIDTH + i] = saved_line[i];
     vga_set_cursor(old_x, old_y);
+    vga_taskbar_refresh();
 }
 
 void cmd_format(void) {
@@ -263,62 +333,52 @@ void cmd_format(void) {
         return;
     }
     uint32_t part_sectors = disk_total_sectors - 1;
+    vga_write("Creating MBR + Linux ext2 partition (type 0x83)...\n", VGA_COLOR_LIGHT_GREEN);
     char buf[32];
     int_to_str((int)part_sectors, buf);
-    vga_write("Creating Linux ext2 partition (type 0x83), ", VGA_COLOR_LIGHT_GREEN);
     vga_write(buf, VGA_COLOR_LIGHT_GREEN);
-    vga_write(" sectors...\n", VGA_COLOR_LIGHT_GREEN);
+    vga_write(" sectors.\n", VGA_COLOR_LIGHT_GREEN);
 
-    if (disk_create_ext2_partition(1, part_sectors) == 0) {
-        vga_write("MBR written. Partition created.\n", VGA_COLOR_LIGHT_GREEN);
-        ata_flush();
-        partition_offset = 1;
-        fs_init();
-        if (fs_format_partition(part_sectors) == 0) {
-            vga_write("EXT2 filesystem created and mounted.\n", VGA_COLOR_LIGHT_GREEN);
-            fs_sync_to_disk();
-            ata_flush();
-        } else {
-            vga_write("EXT2 mkfs failed.\n", VGA_COLOR_LIGHT_RED);
-            partition_offset = 0;
-            fs_init();
-        }
-    } else {
+    if (disk_create_ext2_partition(1, part_sectors) != 0) {
         vga_write("Failed to write MBR.\n", VGA_COLOR_LIGHT_RED);
+        return;
+    }
+    ata_flush();
+    partition_offset = 1;
+    fs_init();
+    if (fs_format_partition(part_sectors) == 0) {
+        vga_write("EXT2 filesystem created and mounted.\n", VGA_COLOR_LIGHT_GREEN);
+        fs_sync_to_disk();
+        ata_flush();
+    } else {
+        vga_write("EXT2 mkfs failed.\n", VGA_COLOR_LIGHT_RED);
+        partition_offset = 0;
+        fs_init();
     }
 }
 
-static void show_progress(int current, int total, const char *label) {
-    char buf[80];
-    int percent = (current * 100) / total;
-    int bar_len = 20;
-    int filled = (percent * bar_len) / 100;
-    int i;
-    char *p = buf;
-    *p++ = '[';
-    for (i = 0; i < bar_len; i++)
-        *p++ = (i < filled) ? '#' : '.';
-    *p++ = ']';
-    *p++ = ' ';
-    char perc_str[4];
-    int_to_str(percent, perc_str);
-    int len = strlen(perc_str);
-    if (len == 1) {
-        *p++ = ' ';
-        *p++ = ' ';
-    } else if (len == 2) {
-        *p++ = ' ';
+void cmd_mkfs(void) {
+    if (disk_total_sectors == 0) {
+        vga_write("Error: disk size unknown.\n", VGA_COLOR_LIGHT_RED);
+        return;
     }
-    strcpy(p, perc_str);
-    p += len;
-    *p++ = '%';
-    *p++ = ' ';
-    strcpy(p, label);
-    uint8_t old_x, old_y;
-    vga_get_cursor(&old_x, &old_y);
-    vga_set_cursor(0, VGA_LAST_TEXT_ROW);
-    vga_write(buf, VGA_COLOR_LIGHT_CYAN);
-    vga_set_cursor(old_x, old_y);
+    vga_write("Formatting whole disk (no MBR) as ext2...\n", VGA_COLOR_LIGHT_CYAN);
+    ata_flush();
+    partition_offset = 0;
+    fs_init();
+    if (fs_format_partition(disk_total_sectors) == 0) {
+        vga_write("EXT2 filesystem created and mounted.\n", VGA_COLOR_LIGHT_GREEN);
+        fs_sync_to_disk();
+        ata_flush();
+    } else {
+        vga_write("EXT2 mkfs failed.\n", VGA_COLOR_LIGHT_RED);
+        partition_offset = 0;
+        fs_init();
+    }
+}
+
+void kprintf(const char *str, uint8_t color) {
+    vga_write(str, color);
 }
 
 void kmain(uint32_t magic, uint32_t addr) {
@@ -330,89 +390,67 @@ void kmain(uint32_t magic, uint32_t addr) {
     vga_init();
     idt_install();
     srand(0xC001D00Du);
-    vga_write("YodaOS 1.2 (x86_64)\n", VGA_COLOR_LIGHT_CYAN);
 
-    if (ata_init() == 0) {
-        vga_write("ATA drive detected. ", VGA_COLOR_LIGHT_GREEN);
-        char buf[32];
-        int_to_str(disk_total_sectors, buf);
-        vga_write(buf, VGA_COLOR_LIGHT_GREEN);
-        vga_write(" sectors.\n", VGA_COLOR_LIGHT_GREEN);
-    } else {
-        vga_write("No ATA drive. Halting.\n", VGA_COLOR_LIGHT_RED);
+    dbstring(&DEBUG, "VGA, IDT, SRAND: OK");
+
+    if (ata_init() != 0) {
+        kprintf("ATA init failed\n", VGA_COLOR_LIGHT_RED);
+        dbstring(&ERR, "ATA init failed.");
         while(1);
     }
+    kprintf("[init] ATA: OK, ", VGA_COLOR_LIGHT_GREEN);
+    dbstring(&DEBUG, "ATA: OK");
+    char buf[32];
+    int_to_str(disk_total_sectors, buf);
+    kprintf(buf, VGA_COLOR_LIGHT_GREEN);
+    kprintf(" sectors\n", VGA_COLOR_LIGHT_GREEN);
+    dbstring(&INFO, buf);
+    dbstring(&INFO, "ATA SECTORS ^");
 
     fs_init();
+    dbstring(&DEBUG, "EXT2: OK");
 
-    uint32_t part_start, part_sectors;
-    if (disk_find_ext2_partition(&part_start, &part_sectors) == 0) {
-        partition_offset = part_start;
-        char buf[32];
-        int_to_str((int)part_start, buf);
-        vga_write("Found ext2 (Linux 0x83) partition at LBA ", VGA_COLOR_LIGHT_GREEN);
-        vga_write(buf, VGA_COLOR_LIGHT_GREEN);
-        vga_write("\n", VGA_COLOR_LIGHT_GREEN);
-        fs_load_from_disk();
-        fs_ensure_mounted();
+    int mounted = 0;
+    partition_offset = 1;
+    if (fs_load_from_disk() == 0) {
+        kprintf("[ext2] mounted at offset 1 (partition)\n", VGA_COLOR_LIGHT_GREEN);
+        dbstring(&DEBUG, "EXT2: mounted at offset 1 (partition)");
+        mounted = 1;
     } else {
-        vga_write("No ext2 partition; auto-initializing disk (first boot)...\n", VGA_COLOR_LIGHT_BROWN);
-        uint32_t ps = disk_total_sectors > 1 ? disk_total_sectors - 1 : 0;
-        if (ps >= 1024 && disk_create_ext2_partition(1, ps) == 0) {
-            ata_flush();
-            partition_offset = 1;
-            fs_init();
-            if (fs_format_partition(ps) == 0) {
-                ata_flush();
-                fs_load_from_disk();
-                fs_ensure_mounted();
-                vga_write("ext2 created and mounted at /disk.\n", VGA_COLOR_LIGHT_GREEN);
-                fs_sync_to_disk();
-            } else {
-                vga_write("ext2 mkfs failed; use format when ready.\n", VGA_COLOR_LIGHT_RED);
-                partition_offset = 0;
-                fs_init();
-            }
-        } else {
-            vga_write("Disk too small or MBR write failed; use format later.\n", VGA_COLOR_LIGHT_RED);
-            partition_offset = 0;
+        partition_offset = 0;
+        if (fs_load_from_disk() == 0) {
+            kprintf("[ext2] mounted at offset 0 (whole disk)\n", VGA_COLOR_LIGHT_GREEN);
+            dbstring(&DEBUG, "EXT2: mounted at offset 0 (whole disk)");
+            mounted = 1;
         }
     }
+    if (!mounted) {
+        kprintf("[ext2] mount failed!\n", VGA_COLOR_LIGHT_RED);
+        dbstring(&ERR, "EXT2: Mount failed!");
+        while(1);
+    }
+    fs_cd("/");
+    dbstring(&DEBUG, "EXT2: Going to the directory '/' ");
 
     sound_init();
+    kprintf("[init] PC speaker: OK\n", VGA_COLOR_LIGHT_GREEN);
+    dbstring(&DEBUG, "PC speaker: OK");
 
-    ramfs_init();
-    busybox_seed_ramfs();
-
-    if (fs_has_user_content()) {
-        show_progress(1, 1, "FS loaded");
+    /*/uint8_t test_buf[10]; Это будущий загрузчик ELF static файлов)
+    uint32_t test_sz;
+    if (fs_open("/test.elf", test_buf, 10, &test_sz) == 0) {
+        kprintf("test.elf opened, size=", VGA_COLOR_LIGHT_GREEN);
+        char tmp[16];
+        int_to_str(test_sz, tmp);
+        kprintf(tmp, VGA_COLOR_LIGHT_GREEN);
+        kprintf("\n", VGA_COLOR_LIGHT_GREEN);
     } else {
-        const char *init_items[] = {"DRV", "BOOT", "KRN", "USR", "TMP", "kernel_panic.sysdump.bin"};
-        int total = sizeof(init_items) / sizeof(init_items[0]);
-        for (int i = 0; i < total; i++) {
-            show_progress(i, total, init_items[i]);
-            if (i < 5)
-                fs_create(init_items[i], 1);
-            else
-                fs_create(init_items[i], 0);
-        }
-        show_progress(total, total, "Done!");
-    }
-
-    fs_sync_to_disk();
-    fs_ensure_mounted();
-    if (partition_offset != 0 && !fs_is_mounted()) {
-        vga_write("WARNING: ext2 partition at LBA ", VGA_COLOR_LIGHT_RED);
-        char lb[16];
-        int_to_str((int)partition_offset, lb);
-        vga_write(lb, VGA_COLOR_LIGHT_RED);
-        vga_write(" not readable (check disk.img).\n", VGA_COLOR_LIGHT_RED);
-    }
-
-    cmd_clear();
-    vga_write("YodaOS 2.0 Beta test\n", VGA_COLOR_LIGHT_CYAN);
-    vga_write("ATA drive detected.\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("BusyBox / ; ext2 from /disk. RamFS in RAM — cp в /disk/.... Ring3: int 0x80 1=write 2=getpid.\n", VGA_COLOR_LIGHT_GREEN);
-    vga_write("Type 'help -p' for commands.\n", VGA_COLOR_LIGHT_GREY);
+        kprintf("test.elf not found\n", VGA_COLOR_LIGHT_RED);
+    }/*/
+    dbstring(&INFO, "System started!");
+    dbstring(&INFO, "Login as 'root'");
+    log_save_to_file();
+    cmd_asciiart();
+    vga_write("YodaOS version 2.0 (Beta test edition)\n", VGA_COLOR_LIGHT_GREEN);
     shell_run();
 }

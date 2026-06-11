@@ -130,6 +130,15 @@ void ramfs_init(void) {
     pool_used = 0;
     bb_cwd[0] = '/';
     bb_cwd[1] = 0;
+
+    // Создаём корневой узел (id 0) – пустой каталог
+    nodes[0].used = 1;
+    nodes[0].parent = 0;
+    nodes[0].name[0] = 0;      // имя пустое
+    nodes[0].kind = BB_KIND_DIR;
+    nodes[0].spec = SP_NONE;
+    nodes[0].data_off = 0;
+    nodes[0].data_len = 0;
 }
 
 size_t ramfs_bytes_used(void) { return pool_used; }

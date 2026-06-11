@@ -8,7 +8,7 @@
 #define VGA_TASKBAR_ROW   (VGA_HEIGHT - 1)
 #define VGA_LAST_TEXT_ROW (VGA_HEIGHT - 2)
 #define VGA_MEMORY ((uint16_t*)(uintptr_t)0xB8000)
-
+#define VGA_COLOR_LIGHT_YELLOW VGA_COLOR_LIGHT_BROWN
 enum vga_color {
     VGA_COLOR_BLACK = 0,
     VGA_COLOR_BLUE = 1,
@@ -78,5 +78,7 @@ void sound_off(void);
 uint8_t cmos_read(uint8_t reg);
 void get_rtc_time(int *hour, int *minute, int *second);
 void get_rtc_date(int *year, int *month, int *day);
+
+uint8_t wait_for_key(void);
 
 #endif

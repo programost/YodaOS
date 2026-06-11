@@ -201,8 +201,9 @@ int bb_kernel_dispatch(int argc, char **argv) {
         return 1;
     }
     if (strcmp(a0, "ring3test") == 0) {
-        vga_write("Entering ring3 demo (syscall int 0x80)...\n", VGA_COLOR_LIGHT_CYAN);
-        jump_user_ring3((uint64_t)(uintptr_t)ring3_demo_entry, 0x600000ull);
+        vga_write("Entering ring3 demo...\n", VGA_COLOR_LIGHT_CYAN);
+        extern uint8_t user_ring3_stack[];
+        jump_user_ring3((uint64_t)(uintptr_t)ring3_demo_entry, (uint64_t)(uintptr_t)(user_ring3_stack + 4096));
         return 1;
     }
     if (strcmp(a0, "panic_test") == 0) {
@@ -364,8 +365,9 @@ static int applet_wc(int argc, char **argv) {
                 wc++;
                 inw = 0;
             }
-        } else
+        } else {
             inw = 1;
+        }
     }
     if (inw) wc++;
     char tmp[16];
@@ -459,7 +461,8 @@ static int applet_grep(int argc, char **argv) {
                 }
             }
             if (hit) {
-                for (int k = line_start; k < (int)i; k++) vga_putchar((char)buf[k], VGA_COLOR_LIGHT_GREY);
+                for (int k = line_start; k < (int)i; k++)
+                    vga_putchar((char)buf[k], VGA_COLOR_LIGHT_GREY);
                 vga_write("\n", VGA_COLOR_LIGHT_GREY);
             }
             line_start = (int)i + 1;
@@ -475,7 +478,8 @@ static void print_basename(const char *path, const char *suf) {
     if (suf && *suf) {
         size_t bl = strlen(base), sl = strlen(suf);
         if (bl >= sl && strcmp(base + bl - sl, suf) == 0) {
-            for (size_t i = 0; i < bl - sl; i++) vga_putchar(base[i], VGA_COLOR_LIGHT_GREY);
+            for (size_t i = 0; i < bl - sl; i++)
+                vga_putchar(base[i], VGA_COLOR_LIGHT_GREY);
             vga_write("\n", VGA_COLOR_LIGHT_GREY);
             return;
         }

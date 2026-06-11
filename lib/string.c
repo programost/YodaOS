@@ -100,3 +100,11 @@ char *strstr(const char *haystack, const char *needle) {
     }
     return 0;
 }
+
+char *strncat(char *dest, const char *src, size_t n) {
+    char *d = dest;
+    while (*d) d++;
+    while (n-- && *src) *d++ = *src++;
+    *d = 0;
+    return dest;
+}

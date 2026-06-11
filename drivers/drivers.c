@@ -58,7 +58,17 @@ void vga_putchar(char c, uint8_t color) {
 void vga_write(const char *str, uint8_t color) {
     while (*str) vga_putchar(*str++, color);
 }
-
+uint8_t wait_for_key(void) {
+    uint8_t sc;
+    // Ждём, пока не появится скан-код (не 0)
+    do {
+        while (!(inb(0x64) & 1)) {
+            __asm__ volatile("pause" ::: "memory");
+        }
+        sc = inb(0x60);
+    } while (sc == 0); // Игнорируем нулевые скан-коды
+    return sc;
+}
 void vga_clear(uint8_t color) {
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
         VGA_MEMORY[i] = (color << 8) | ' ';
@@ -79,7 +89,7 @@ void vga_get_cursor(uint8_t *x, uint8_t *y) {
 }
 
 void vga_taskbar_refresh(void) {
-    int pct = ramfs_usage_percent();
+    int pct = 0; // временно, ramfs отключена
     uint16_t bar_attr = (uint16_t)((VGA_COLOR_LIGHT_CYAN << 8) | 0x20);
     uint16_t fill_attr = (uint16_t)((VGA_COLOR_LIGHT_GREEN << 8) | 0x23);
     int row = VGA_TASKBAR_ROW;

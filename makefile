@@ -11,10 +11,9 @@ CFLAGS = -m64 -mno-red-zone -ffreestanding -nostdlib -nostdinc -fno-pie -fno-sta
 ASMFLAGS = -f elf64
 LDFLAGS = -m elf_x86_64 -T linker.ld -no-pie -nostdlib
 
-OBJS = $(BUILD)/boot.o $(BUILD)/asm_funcs.o $(BUILD)/intr.o $(BUILD)/usr_entry.o \
-	$(BUILD)/ring3_demo.o $(BUILD)/idt.o $(BUILD)/syscall.o \
-	$(BUILD)/kernel.o $(BUILD)/drivers.o $(BUILD)/fs.o $(BUILD)/ramfs.o \
-	$(BUILD)/string.o $(BUILD)/bb_applets.o $(BUILD)/shell.o
+OBJS = build/boot.o build/asm_funcs.o build/intr.o build/usr_entry.o build/ring3_demo.o \
+       build/idt.o build/syscall.o build/kernel.o build/drivers.o build/fs.o \
+       build/string.o build/shell.o build/elf.o build/log.o
 
 .PHONY: all clean run
 
@@ -38,7 +37,13 @@ $(BUILD)/usr_entry.o: arch/x86_64/usr_entry.asm | $(BUILD)
 $(BUILD)/ring3_demo.o: arch/x86_64/ring3_demo.asm | $(BUILD)
 	$(ASM) $(ASMFLAGS) $< -o $@
 
+#$(BUILD)/enrty.o: arch/x86_64/entry.asm | $(BUILD)
+#	$(ASM) $(ASMFLAGS) $< -o $@
+
 $(BUILD)/idt.o: arch/x86_64/idt.c | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/log.o: kernel/log.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/syscall.o: arch/x86_64/syscall.c | $(BUILD)
@@ -53,17 +58,14 @@ $(BUILD)/drivers.o: drivers/drivers.c | $(BUILD)
 $(BUILD)/fs.o: fs/fs.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/ramfs.o: ramfs/ramfs.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
 $(BUILD)/string.o: lib/string.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/bb_applets.o: ramfs/bb_applets.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/shell.o: shell/shell.c | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+build/elf.o: user/elf.c include/*.h
+	gcc $(CFLAGS) -c $< -o $@
 
 kernel.elf: $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^

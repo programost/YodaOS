@@ -73,10 +73,27 @@ shutdown:
     out dx, ax
     hlt
 
-wait_for_key:
-    in al, 0x64
-    test al, 1
-    jz wait_for_key
-    xor rax, rax
-    in al, 0x60
+global syscall_setup
+syscall_setup:
+    ; STAR MSR (0xC0000081): 32-47 = CS, 48-63 = SS для sysret
+    ; Для 64-bit: нижние 32 бита = CS пользователя (0x1B), верхние 32 бита = CS ядра (0x08)
+    mov ecx, 0xC0000081
+    mov edx, 0x001B0008   ; CS user = 0x1B (code32?), но для 64-bit нужно другое
+    mov eax, 0x00000000
+    wrmsr
+
+    ; LSTAR (0xC0000082): адрес обработчика syscall
+    mov ecx, 0xC0000082
+    mov rax, syscall_entry
+    mov rdx, rax
+    shr rdx, 32
+    wrmsr
+
+    ; SFMASK (0xC0000084): маска RFLAGS для syscall (сбросить IF и другие)
+    mov ecx, 0xC0000084
+    mov eax, 0x200         ; сбросить IF
+    xor edx, edx
+    wrmsr
     ret
+
+extern syscall_entry

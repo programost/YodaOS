@@ -1,6 +1,10 @@
 #include "string.h"
 #include "types.h"
 
+extern void isr_gpf(void);
+extern void isr_page_fault(void);
+extern void isr_of(void);
+
 struct idt_entry {
     uint16_t off_lo;
     uint16_t sel;
@@ -37,4 +41,9 @@ void idt_install(void) {
     idtp.limit = (uint16_t)(sizeof(idt) - 1);
     idtp.base = (uint64_t)(uintptr_t)idt;
     __asm__ volatile("lidt %0" : : "m"(idtp));
+
+    idt_set_gate(13, isr_gpf, 0x8E);   // #GP
+    idt_set_gate(14, isr_page_fault, 0x8E); // #PF
+    idt_set_gate(4, isr_of, 0x8E);     // #OF
 }
+

@@ -33,10 +33,10 @@ section .rodata
 align 8
 gdt_start:
     dq 0
-    dq 0x00AF9A000000FFFF
-    dq 0x00CF92000000FFFF
-    dq 0x00AFFA000000FFFF
-    dq 0x00CFF2000000FFFF
+    dq 0x00AF9A000000FFFF   ; code kernel (DPL=0)
+    dq 0x00CF92000000FFFF   ; data kernel (DPL=0)
+    dq 0x00AFFA000000FFFF   ; code user (DPL=3)  -> индекс 3 (0x18)
+    dq 0x00CFF2000000FFFF   ; data user (DPL=3)  -> индекс 4 (0x20)
 gdt_end:
 
 gdt_ptr:
@@ -66,7 +66,7 @@ start:
 
     ; PD[i]: 2 MiB страницы, identity map первых ~1 ГиБ
     mov edi, pd
-    mov eax, 0x83
+    mov eax, 0x87        
     mov ecx, 512
 .map_pd:
     mov [edi], eax
